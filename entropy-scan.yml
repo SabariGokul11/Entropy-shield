@@ -1,0 +1,120 @@
+name: EntropyShield Secret Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+  security-events: write   # required for uploading SARIF to Code Scanning
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Entropy Scan
+  # ─────────────────────────────────────────────────────────────────────────────
+  entropy-scan:
+    name: "Entropy Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for git diff
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build EntropyShield
+        run: go build -o entropy-shield ./cmd/main.go
+
+      - name: Run entropy scan (diff only)
+        id: scan
+        run: |
+          BASE=${{ github.event.pull_request.base.sha || 'HEAD~1' }}
+          ./entropy-shield scan \
+            --min-entropy 4.5 \
+            --config .entropy-shield.yaml \
+            $(git diff --name-only $BASE HEAD) \
+            2>&1 | tee scan-output.txt
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: entropy-shield.sarif
+        continue-on-error: true   # don't fail if no SARIF was generated
+
+      - name: Annotate PR with findings
+        if: steps.scan.outputs.exit_code != '0' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('scan-output.txt', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🚨 EntropyShield — Secrets Detected\n\n\`\`\`\n${output.slice(0, 6000)}\n\`\`\`\n\n> Run \`entropy-shield scan --auto-vault\` locally to auto-remediate.`
+            });
+
+      - name: Fail if secrets found
+        if: steps.scan.outputs.exit_code != '0'
+        run: |
+          echo "::error::EntropyShield blocked this push — high-entropy secrets detected."
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Auto-Remediate (manual trigger or on a dedicated branch)
+  # ─────────────────────────────────────────────────────────────────────────────
+  auto-remediate:
+    name: "Auto-Remediate & Vault"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: vault-integration   # requires VAULT_ADDR + VAULT_TOKEN secrets
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build EntropyShield
+        run: go build -o entropy-shield ./cmd/main.go
+
+      - name: Authenticate to Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: token
+          token: ${{ secrets.VAULT_TOKEN }}
+
+      - name: Scan and auto-vault secrets
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          ./entropy-shield scan \
+            --auto-vault \
+            --vault-path "secret/entropy-shield/${{ github.repository }}" \
+            $(git diff --name-only HEAD~1 HEAD)
+
+      - name: Commit rewritten files
+        run: |
+          git config user.name  "EntropyShield Bot"
+          git config user.email "entropy-shield[bot]@noreply.github.com"
+          git add -u
+          git diff --cached --quiet || git commit -m "chore(security): replace hardcoded secrets with Vault env refs [entropy-shield]"
+          git push
